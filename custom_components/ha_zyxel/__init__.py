@@ -2,6 +2,7 @@
 import asyncio
 import logging
 from datetime import timedelta
+import requests
 
 import async_timeout
 from homeassistant.config_entries import ConfigEntry
@@ -46,29 +47,42 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async def async_update_data():
         """Fetch data from the router."""
+        def get_all_data(retries=2):
+            while retries > 0:
+                try:                        
+                    data = router.get_json_object('status')
+                    if data:
+                        return data
+                    
+                    # when data is empty but does not throw an exception
+                    retries -= 1
+                    
+                except requests.exceptions.HTTPError as e:
+                    _LOGGER.debug("Zyxel HTTP Error (%s), retries left: %s", e.response.status_code, retries - 1)
+                    if e.response.status_code == 401:
+                        # Unauthorized - attempt login
+                        login_success = router.login()
+                        if not login_success:
+                            break
+                    elif e.response.status_code == 500:
+                        # Internal server error - retry without cookies
+                        router.clear_cookies()
+                    retries -= 1
+                except Exception as err:
+                    _LOGGER.error("Unexpected error reading from Zyxel: %s", err)
+                    break
+            
+            return None
+        
         try:
-            async with async_timeout.timeout(15):
-                def get_all_data():
-                    data = router.get_status()
-
-                    if not data:
-                        raise UpdateFailed("No data received from router")
-
-                    # Get device info if not already in data
-                    if "device" not in data or not data["device"]:
-                        device_info = router.get_json_object("status")
-                        if device_info:
-                            data["device_info"] = device_info
-
-                    return data
-
+            async with async_timeout.timeout(30):
                 return await hass.async_add_executor_job(get_all_data)
-        except asyncio.TimeoutError:
-            router._session_valid = False
-            raise UpdateFailed("Router data fetch timed out")
         except Exception as err:
-            router._session_valid = False
+            # Force new login at next retry
+            router._session_valid = False 
+            _LOGGER.debug("Error updating Zyxel data: %s", err)
             raise UpdateFailed(f"Error communicating with router: {err}") from err
+
 
     coordinator = DataUpdateCoordinator(
         hass,

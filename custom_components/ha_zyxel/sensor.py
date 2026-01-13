@@ -11,11 +11,16 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.entity import (
+    DeviceInfo,
+    EntityCategory,
+)
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from custom_components.ha_zyxel.const import DOMAIN
+
+from .entity import ZyxelEntity
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -154,6 +159,33 @@ KNOWN_SENSORS = {
         "device_class": SensorDeviceClass.DATA_SIZE,
         "state_class": SensorStateClass.TOTAL_INCREASING,
     },
+    "Total": {
+        "name": "Total memory",
+        "unit": "B",
+        "icon": "mdi:memory",
+        "device_class": SensorDeviceClass.DATA_SIZE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "entity_registry_enabled_default": False
+    },
+    "Free": {
+        "name": "Free memory",
+        "unit": "B",
+        "icon": "mdi:memory",
+        "device_class": SensorDeviceClass.DATA_SIZE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "entity_registry_enabled_default": False
+    },
+    "CPUUsage": {
+        "name": "CPU Usage",
+        "unit": "%",
+        "icon": "mdi:gauge",
+        "device_class": None,
+        "state_class": None,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "entity_registry_enabled_default": False        
+    },
 }
 
 
@@ -170,8 +202,19 @@ def _flatten_dict(d: dict, parent_key: str = "") -> dict:
 
 
 def _is_value_scalar(value: Any) -> bool:
-    """Check if a value is a scalar (string, number, bool)."""
-    return isinstance(value, (str, int, float, bool)) or value is None
+    """
+    Check if a value is a scalar:
+    - Numeric (int, float)
+    - Boolean
+    - String (must contains non-whitespace characters)
+    """
+    if isinstance(value, (int, float, bool)) or value is None:
+        return True
+    
+    if isinstance(value, str):
+        return len(value.strip()) > 0
+
+    return False
 
 
 async def async_setup_entry(
@@ -193,45 +236,44 @@ async def async_setup_entry(
             continue
 
         # Check if this is a known sensor type
-        sensor_config = KNOWN_SENSORS.get(key.split(".")[-1], None)
+        base_key = key.split(".")[-1]
 
-        if sensor_config:
-            # Create a configured sensor for known types
-            sensors.append(
-                ConfiguredZyxelSensor(
-                    coordinator,
-                    entry,
-                    key,
-                    sensor_config
-                )
-            )
-        else:
-            # Create a generic sensor for unknown types
-            sensors.append(
-                GenericZyxelSensor(
-                    coordinator,
-                    entry,
-                    key
-                )
-            )
+        if base_key == "UpTime":
+            continue  # Skip UpTime as it's handled by a dedicated sensor with unknown as attributes
+        
+        if base_key in KNOWN_SENSORS:
+            sensors.append(ConfiguredZyxelSensor(coordinator, entry, key, KNOWN_SENSORS[base_key]))
+        
+    sensors.append(ZyxelDiagnosticsSensor(coordinator, entry))
+    
+    async_add_entities(sensors)
 
-    if sensors:
-        async_add_entities(sensors)
-
-
-class AbstractZyxelSensor(CoordinatorEntity, SensorEntity):
+class AbstractZyxelSensor(ZyxelEntity, SensorEntity):
     """Base class for Zyxel device sensors."""
 
     def __init__(self, coordinator, entry: ConfigEntry, key: str):
         """Initialize the sensor."""
-        super().__init__(coordinator)
+        super().__init__(coordinator, entry)
         self._key = key
         self._attr_unique_id = f"{entry.entry_id}_{key}"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry.entry_id)},
-            name=f"Zyxel ({entry.data['host']})",
+        self._attr_has_entity_name = True
+
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Connect to device dynamically."""
+        # Try to get the model from the data, otherwise fallback to Zyxel Device
+        data = self.coordinator.data
+        model_name = "Zyxel Router"
+        
+        if data and "DeviceInfo" in data:
+            model_name = data["DeviceInfo"].get("ModelName", "Zyxel Device")
+
+        return DeviceInfo(
+            identifiers={(DOMAIN, self._entry.entry_id)},
+            name=f"Zyxel ({self._entry.data['host']})",
             manufacturer="Zyxel",
-            model="",
+            model=model_name,
         )
 
     @property
@@ -249,10 +291,17 @@ class AbstractZyxelSensor(CoordinatorEntity, SensorEntity):
 
     def _get_value_from_path(self) -> Any:
         """Get a value from nested dictionaries using the flattened key."""
+        data = self.coordinator.data
+        if not data:
+            return None
+            
         keys = self._key.split(".")
-        value = self.coordinator.data
+        value = data
         for k in keys:
-            value = value[k]
+            if isinstance(value, dict):
+                value = value.get(k)
+            else:
+                return None
         return value
 
 
@@ -264,38 +313,78 @@ class ConfiguredZyxelSensor(AbstractZyxelSensor):
         super().__init__(coordinator, entry, key)
         self._config = config
         self._attr_name = f"Zyxel {config['name']}"
-        self._attr_native_unit_of_measurement = config["unit"]
-        self._attr_icon = config["icon"]
-        self._attr_device_class = config["device_class"]
-        self._attr_state_class = config["state_class"]
+        self._attr_native_unit_of_measurement = config.get("unit")
+        self._attr_icon = config.get("icon")
+        self._attr_device_class = config.get("device_class")
+        self._attr_state_class = config.get("state_class")        
+        self._attr_entity_category = config.get("entity_category")
+        self._attr_entity_registry_enabled_default = config.get("entity_registry_enabled_default", True)
 
     @property
-    def state(self):
+    def native_value(self) -> Any:
         """Return the state of the sensor."""
         try:
             return self._get_value_from_path()
-        except (KeyError, AttributeError):
+        except (KeyError, AttributeError, TypeError):
             return None
 
+class ZyxelDiagnosticsSensor(ZyxelEntity, SensorEntity):
+    """Sensor with all unknown data as attributes."""
 
-class GenericZyxelSensor(AbstractZyxelSensor):
-    """Representation of a generic Zyxel sensor."""
+    _attr_name = "Router Status"
+    _attr_icon = "mdi:information-outline"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_has_entity_name = True
+
+    def __init__(self, coordinator, entry):
+        super().__init__(coordinator, entry)
+        self._attr_unique_id = f"{entry.entry_id}_uptime"
+        self._last_uptime = 0
 
     @property
-    def name(self):
-        """Return the name of the sensor."""
-        name_parts = self._key.split(".")
-        return f"Zyxel {'.'.join(name_parts)}"
-
-    @property
-    def state(self):
-        """Return the state of the sensor."""
+    def native_value(self) -> str:
+        """Determine status based on uptime trend."""
         try:
-            return self._get_value_from_path()
-        except (KeyError, AttributeError):
-            return None
+            current_uptime = int(float(self.coordinator.data.get("DeviceInfo", {}).get("UpTime", 0)))
+        except (ValueError, TypeError):
+            return "Unknown"
+
+        # Determine status
+        if self._last_uptime == 0:
+            # Reboot of HA, only if router was reset less than 120 seconds ago we consider this a reboot
+            if current_uptime < 120:
+                status = "Reset"
+            else:
+                status = "Up"
+        elif current_uptime < self._last_uptime:
+            # Current uptime lower than last uptime this is a reboot while HA was running
+            status = "Reset"
+        else:
+            # Normal operation
+            status = "Up"
+        
+        # Store new uptime for next check
+        self._last_uptime = current_uptime
+        return status
 
     @property
-    def icon(self):
-        """Return the icon."""
-        return "mdi:router-wireless"
+    def extra_state_attributes(self):
+        """Store all flattened data as attributes, except the known sensors."""
+        attrs = {}
+        flattened_data = _flatten_dict(self.coordinator.data)
+        
+        # Add uptime so we can still see it as an attribute
+        attrs["uptime_seconds"] = self._last_uptime
+        
+        for key, value in flattened_data.items():
+            if not _is_value_scalar(value):
+                continue
+
+            base_key = key.split(".")[-1]
+            # Only when NOT a known sensor (to avoid duplicate data)
+            if base_key not in KNOWN_SENSORS and base_key != "UpTime":
+                # Replace dots with underscores for clean attribute names
+                attr_name = key.replace(".", "_")
+                attrs[attr_name] = value
+                
+        return attrs
