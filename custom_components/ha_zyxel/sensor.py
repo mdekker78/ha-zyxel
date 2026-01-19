@@ -1,6 +1,7 @@
 """Support for Zyxel device sensors."""
 from __future__ import annotations
 
+from datetime import timedelta
 import logging
 from typing import Any
 
@@ -16,7 +17,7 @@ from homeassistant.helpers.entity import (
     EntityCategory,
 )
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from custom_components.ha_zyxel.const import DOMAIN
 
@@ -234,6 +235,10 @@ async def async_setup_entry(
         # Skip non-scalar values
         if not _is_value_scalar(value):
             continue
+        
+        # Skip LAN_client as it's handled by the device_tracker
+        if key.startswith("LAN_client"):
+            continue
 
         # Check if this is a known sensor type
         base_key = key.split(".")[-1]
@@ -340,6 +345,7 @@ class ZyxelDiagnosticsSensor(ZyxelEntity, SensorEntity):
         super().__init__(coordinator, entry)
         self._attr_unique_id = f"{entry.entry_id}_uptime"
         self._last_uptime = 0
+        self._last_reset_time = None
 
     @property
     def native_value(self) -> str:
@@ -362,6 +368,10 @@ class ZyxelDiagnosticsSensor(ZyxelEntity, SensorEntity):
         else:
             # Normal operation
             status = "Up"
+
+        if status == "Reset":
+            # Calculate the reset time: Now - Uptime
+            self._last_reset_time = dt_util.utcnow() - timedelta(seconds=current_uptime)
         
         # Store new uptime for next check
         self._last_uptime = current_uptime
@@ -375,6 +385,10 @@ class ZyxelDiagnosticsSensor(ZyxelEntity, SensorEntity):
         
         # Add uptime so we can still see it as an attribute
         attrs["uptime_seconds"] = self._last_uptime
+
+        # Add last reset time if available        
+        if self._last_reset_time:
+            attrs["last_reset"] = self._last_reset_time.isoformat()
         
         for key, value in flattened_data.items():
             if not _is_value_scalar(value):

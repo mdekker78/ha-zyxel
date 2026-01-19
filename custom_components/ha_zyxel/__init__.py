@@ -26,7 +26,7 @@ nr7101_logger.setLevel(logging.WARNING)
 
 from nr7101 import nr7101
 
-PLATFORMS = ["sensor", "button"]
+PLATFORMS = ["sensor", "button", "device_tracker"]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -52,6 +52,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 try:                        
                     data = router.get_json_object('status')
                     if data:
+                        # Retrieve the lanhosts and add them to the data dictionary
+                        # We use a try-except specifically for lanhosts to prevent
+                        # the entire update from failing if only the hosts list fails.
+                        try:
+                            lanhosts_data = router.get_json_object('lanhosts')
+                            if lanhosts_data and 'lanhosts' in lanhosts_data:
+                                data['lanhosts'] = lanhosts_data['lanhosts']
+                            else:
+                                # Sometimes the list is directly in the object, depending on the API response
+                                data['lanhosts'] = lanhosts_data if isinstance(lanhosts_data, list) else []
+                        except Exception as host_err:
+                            _LOGGER.warning("Could not fetch lanhosts: %s", host_err)
+                            data['lanhosts'] = [] # Make sure key exists for the device_tracker
+
                         return data
                     
                     # when data is empty but does not throw an exception
